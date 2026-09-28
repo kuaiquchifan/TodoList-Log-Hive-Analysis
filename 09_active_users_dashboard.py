@@ -15,10 +15,10 @@ import seaborn as sns
 # ---------- CONFIG ----------
 PARQUET_ACTIVE = "output_aggregate_further_data/01_dws_user_active_1d.parquet"
 PARQUET_DATE = "output_data/02_dim_date.parquet"
-PARQUET_NEWOLD = "output_aggregate_further_data/07_dws_new_old_user_summary.parquet"
+PARQUET_NEWOLD = "output_aggregate_further_data/07_dws_new_old_user_summary_by_register_date.parquet"
 PARQUET_BEHAVIOR = "output_aggregate_further_data/02_dws_user_behavior_summary.parquet"
 PARQUET_USER = "output_data/01_dim_user.parquet"
-PARQUET_RETAIN = "output_aggregate_further_data/08_dws_user_retain_summary.parquet"
+PARQUET_RETAIN = "output_aggregate_further_data/08_dws_user_retain_summary_by_register_date.parquet"
 PARQUET_CHANNEL = "output_aggregate_further_data/06_dws_channel_region_summary.parquet"
 
 # 读文件并缓存（模块加载时）
@@ -137,44 +137,85 @@ def build_extra_figs(df_behavior, df_retain, df_channel):
     try:
         if not df_behavior.empty:
             dfb = df_behavior.copy()
-            date_col = "last_active_date" if "last_active_date" in dfb.columns else None
-            if date_col:
-                dfb["date"] = to_date_series(dfb[date_col])
-                dfb = dfb.dropna(subset=["date"])
-                if "freq_bucket" not in dfb.columns and "active_day_cnt" in dfb.columns:
-                    def bucket(x):
-                        try:
-                            x = float(x)
-                        except Exception:
-                            return "未知"
-                        if x >= 15:
-                            return "高频"
-                        if x >= 5:
-                            return "中频"
-                        if x > 0:
-                            return "低频"
+            active_days = pd.to_numeric(DF_BEHAVIOR["active_day_cnt"], errors="coerce")
+            print(active_days.describe(percentiles=[0.25, 0.5, 0.75, 0.9]))
+
+            active_days_only = active_days[active_days > 0]
+
+            q25 = active_days_only.quantile(0.25)
+            q75 = active_days_only.quantile(0.75)
+            print(f"Q25: {q25}, Q75: {q75}")
+            if {"user_id", "active_day_cnt"}.issubset(dfb.columns):
+                def bucket(value):
+                    days = pd.to_numeric(value, errors="coerce")
+                    if pd.isna(days) or days <= 0:
                         return "无活跃"
-                    dfb["freq_bucket"] = dfb["active_day_cnt"].apply(bucket)
-                if "user_id" in dfb.columns and "freq_bucket" in dfb.columns:
-                    agg = dfb.groupby(["date", "freq_bucket"])["user_id"].nunique().reset_index(name="cnt")
+                    if days <= q25:
+                        return "低频"
+                    if days <= q75:
+                        return "中频"
+                    return "高频"
+
+                # 从用户维表取全体用户；没有对应行为记录的用户按 0 个活跃日处理
+                behavior_users = dfb[["user_id", "active_day_cnt"]].drop_duplicates("user_id")
+                if not DF_USER.empty and "user_id" in DF_USER.columns:
+                    user_freq = DF_USER[["user_id"]].drop_duplicates().merge(
+                        behavior_users,
+                        on="user_id",
+                        how="left"
+                    )
                 else:
-                    agg = pd.DataFrame()
+                    # 若维表不可用，只统计行为汇总表中出现过的用户
+                    user_freq = behavior_users.copy()
 
-                if not agg.empty:
-                    total_users = int(dfb["user_id"].nunique()) if "user_id" in dfb.columns else 0
-                    if "active_day_cnt" in dfb.columns and "user_id" in dfb.columns:
-                        active_mask = pd.to_numeric(dfb["active_day_cnt"], errors="coerce").fillna(0) > 0
-                        active_users = int(dfb.loc[active_mask, "user_id"].nunique())
-                    else:
-                        active_users = 0
-                    inactive_users = max(total_users - active_users, 0)
-                    pie_df = pd.DataFrame({"label": ["活跃用户", "非活跃用户"], "cnt": [active_users, inactive_users]})
-                    freq_pie = px.pie(pie_df, names="label", values="cnt", title="全量用户活跃占比（活跃 vs 非活跃）", hole=0.3)
+                user_freq["active_day_cnt"] = pd.to_numeric(
+                    user_freq["active_day_cnt"], errors="coerce"
+                ).fillna(0)
+                user_freq["freq_bucket"] = user_freq["active_day_cnt"].apply(bucket)
 
-                    freq_bar = px.bar(agg, x="date", y="cnt", color="freq_bucket", barmode="group",
-                                    title="活跃用户频次分层（按最后活跃日 时序）")
+                print(
+                    user_freq["freq_bucket"].value_counts().reindex(
+                        ["无活跃", "低频", "中频", "高频"],
+                        fill_value=0
+                    )
+                )
+
+                bucket_order = ["无活跃", "低频", "中频", "高频"]
+                freq_agg = (
+                    user_freq.groupby("freq_bucket")["user_id"]
+                    .nunique()
+                    .reindex(bucket_order, fill_value=0)
+                    .rename("cnt")
+                    .reset_index()
+                )
+
+                total_users = user_freq["user_id"].nunique()
+                active_users = user_freq.loc[
+                    user_freq["active_day_cnt"] > 0, "user_id"
+                ].nunique()
+
+                pie_df = pd.DataFrame({
+                    "label": ["活跃用户", "非活跃用户"],
+                    "cnt": [active_users, max(total_users - active_users, 0)]
+                })
+                freq_pie = px.pie(
+                    pie_df,
+                    names="label",
+                    values="cnt",
+                    title="全周期用户活跃占比（活跃 vs 非活跃）",
+                    hole=0.3
+                )
+
+                freq_bar = px.bar(
+                    freq_agg,
+                    x="freq_bucket",
+                    y="cnt",
+                    category_orders={"freq_bucket": bucket_order},
+                    title="全周期用户活跃频次分层"
+                )
     except Exception:
-        pass
+        pass  
+
 
     # --- 留存 ---
     try:
